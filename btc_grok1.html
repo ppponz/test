@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>BTC Price, Liquidations, Perp CVD, Spot CVD, and Open Interest with VWAP Bands</title>
+    <script src="https://unpkg.com/lightweight-charts@4.0.1/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body {margin:0;padding:0;overflow-x:hidden;font-family:'Arial',sans-serif;background-color:#0d1117;color:#D3D3D3;}
+        #container {max-width:1400px;margin:5px auto;padding:5px;display:flex;flex-direction:column;gap:5px;height:100vh;}
+        #price-chart {height:70vh;background-color:#161b22;border-radius:4px;box-shadow:0 1px 5px rgba(0,0,0,0.5);overflow:hidden;}
+        .meter-wrapper {height:40px;background-color:#161b22;border-radius:4px;box-shadow:0 1px 5px rgba(0,0,0,0.5);overflow:hidden;position:relative;width:100%;}
+        canvas {width:100%;height:100%;}
+        #loading-overlay {position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);display:flex;justify-content:center;align-items:center;z-index:1000;}
+        #loading-text {color:#888888;font-size:1em;}
+    </style>
+</head>
+<body>
+    <div id="loading-overlay"><div id="loading-text">Loading historical price data...</div></div>
+    <div id="container">
+        <div id="price-chart"></div>
+        <div id="spot-cvd-meter" class="meter-wrapper"><canvas id="spot-cvd-canvas"></canvas></div>
+        <div id="cvd-meter" class="meter-wrapper"><canvas id="cvd-canvas"></canvas></div>
+        <div id="oi-meter" class="meter-wrapper"><canvas id="oi-canvas"></canvas></div>
+        <div id="liq-meter" class="meter-wrapper"><canvas id="liq-canvas"></canvas></div>
+    </div>
+    <script>
+        (async () => {
+            if (typeof LightweightCharts === 'undefined') return;
+            const KRAKEN_WS_URL = 'wss://ws.kraken.com';
+            const BYBIT_WS_URL = 'wss://stream.bybit.com/v5/public/linear';
+            const KRAKEN_OHLC_URL = 'https://api.kraken.com/0/public/OHLC';
+            const BINANCE_OI_URL = 'https://fapi.binance.com/fapi/v1/openInterest';
+            const HISTORY_DAYS = 7;
+            const BAR_INTERVAL = 300;
+            const MAX_BARS = 2016;
+            const TITLE_DELAY = 1000;
+            const OI_POLL_INTERVAL = 1000;
+            const MAX_RECONNECT_DELAY = 16000;
+            const LIQ_SENSITIVITY = 100;
+            const PRESSURE_DECAY = 0.95;
+            const RANGE_PADDING = 1.1;
+            const ANIMATION_DURATION = 300;
+            const VWAP_COLOR = '#FFD700';
+            const UPPER_COLOR = '#FF4500';
+            const LOWER_COLOR = '#00A0A0';
+
+            const elements = {
+                priceChart: document.getElementById('price-chart'),
+                spotCvdCanvas: document.getElementById('spot-cvd-canvas'),
+                cvdCanvas: document.getElementById('cvd-canvas'),
+                oiCanvas: document.getElementById('oi-canvas'),
+                liqCanvas: document.getElementById('liq-canvas'),
+                loadingOverlay: document.getElementById('loading-overlay')
+            };
+
+            let historicalData = [];
+            let currentBar = null;
+            let volumeData = [];
+            let currentVolume = 0;
+            let spotCvdCumulative = 0;
+            let spotCvdHistory = [];
+            let spotCvdMin = 0, spotCvdMax = 0;
+            let lastSpotPrice = null;
+            let lastSpotDirection = 0;
+            let cvdCumulative = 0;
+            let oiCumulative = 0;
+            let lastOiValue = null;
+            let longPressure = 0;
+            let shortPressure = 0;
+            let lastPressureUpdate = Date.now();
+            let tradeCount = 0;
+            let lastLogTime = Date.now();
+            let lastBtcPrice = 0;
+            let cvdHistory = [];
+            let oiHistory = [];
+            let liqHistory = [];
+            let cvdMin = 0, cvdMax = 0;
+            let oiMin = 0, oiMax = 0;
+            let liqMin = 0, liqMax = 0;
+            let titleTimeout = null;
+
+            let spotCvdBarWidth = 0, cvdBarWidth = 0, oiBarWidth = 0, liqBarWidth = 0;
+
+            const spotCvdCtx = elements.spotCvdCanvas.getContext('2d');
+            const cvdCtx = elements.cvdCanvas.getContext('2d');
+            const oiCtx = elements.oiCanvas.getContext('2d');
+            const liqCtx = elements.liqCanvas.getContext('2d');
+
+            const isValidBar = (bar) => bar && ['time', 'open', 'high', 'low', 'close'].every(key => Number.isFinite(bar[key]));
+            const debounceTitle = (price) => {
+                clearTimeout(titleTimeout);
+                titleTimeout = setTimeout(() => {
+                    document.title = `BTC: $${price.toFixed(2)}`;
+                }, TITLE_DELAY);
+            };
+            const formatDollar = (btcValue) => {
+                const actualBtc = btcValue / LIQ_SENSITIVITY;
+                let dollarValue = Math.round((actualBtc * lastBtcPrice) / 500) * 500;
+                const absDollarValue = Math.abs(dollarValue);
+                if (absDollarValue >= 1000000) {
+                    return (btcValue < 0 ? '-' : '') + (absDollarValue / 1000000).toFixed(2) + 'M';
+                } else if (absDollarValue >= 1000) {
+                    return (btcValue < 0 ? '-' : '') + (absDollarValue / 1000).toFixed(2) + 'K';
+                } else {
+                    return (btcValue < 0 ? '-' : '') + '$' + absDollarValue.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+                }
+            };
+
+            const updateConnectionStatus = () => {
+                const allConnected = connectionStatus.kraken && connectionStatus.bybit && connectionStatus.binance;
+            };
+
+            let connectionStatus = { kraken: false, bybit: false, binance: false };
+
+            function createWebSocket(url, onOpen, onMessage, label) {
+                let ws = new WebSocket(url);
+                let reconnectDelay = 2000;
+                ws.onopen = () => {
+                    connectionStatus[label.toLowerCase()] = true;
+                    updateConnectionStatus();
+                    onOpen(ws);
+                    reconnectDelay = 2000;
+                };
+                ws.onmessage = onMessage;
+                ws.onerror = (error) => {
+                    connectionStatus[label.toLowerCase()] = false;
+                    updateConnectionStatus();
+                };
+                ws.onclose = () => {
+                    connectionStatus[label.toLowerCase()] = false;
+                    updateConnectionStatus();
+                    setTimeout(() => {
+                        ws = createWebSocket(url, onOpen, onMessage, label);
+                    }, reconnectDelay);
+                    reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
+                };
+                return ws;
+            }
+
+            function calculateVWAPAndBands() {
+                const prices = historicalData.map(bar => bar.close);
+                const highs = historicalData.map(bar => bar.high);
+                const lows = historicalData.map(bar => bar.low);
+                const volumes = volumeData.map(bar => bar.value);
+                let vwapData = [];
+                let dailyPriceVolumeSum = 0;
+                let dailyVolumeSum = 0;
+                let currentDay = null;
+                for (let i = 0; i < historicalData.length; i++) {
+                    const barTime = historicalData[i].time;
+                    const day = Math.floor(barTime / 86400);
+                    if (currentDay !== day) {
+                        dailyPriceVolumeSum = 0;
+                        dailyVolumeSum = 0;
+                        currentDay = day;
+                    }
+                    dailyPriceVolumeSum += prices[i] * volumes[i];
+                    dailyVolumeSum += volumes[i];
+                    vwapData[i] = dailyVolumeSum > 0 ? dailyPriceVolumeSum / dailyVolumeSum : prices[i];
+                }
+                const highDeviations = highs.map((high, i) => high - vwapData[i]);
+                const lowDeviations = lows.map((low, i) => low - vwapData[i]);
+                let sdData = [];
+                const period = 288;
+                for (let i = 0; i < historicalData.length; i++) {
+                    if (i < period - 1) {
+                        sdData[i] = 0;
+                    } else {
+                        const highSlice = highDeviations.slice(i - period + 1, i + 1);
+                        const lowSlice = lowDeviations.slice(i - period + 1, i + 1);
+                        const combinedSlice = highSlice.concat(lowSlice);
+                        const mean = combinedSlice.reduce((sum, val) => sum + val, 0) / combinedSlice.length;
+                        const variance = combinedSlice.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / (combinedSlice.length - 1);
+                        sdData[i] = Math.sqrt(variance);
+                    }
+                }
+                const vwap = vwapData;
+                const upper1 = vwapData.map((vwap, i) => vwap + 2 * sdData[i]);
+                const upper2 = vwapData.map((vwap, i) => vwap + 4 * sdData[i]);
+                const lower1 = vwapData.map((vwap, i) => vwap - 2 * sdData[i]);
+                const lower2 = vwapData.map((vwap, i) => vwap - 4 * sdData[i]);
+                return { vwap, upper1, upper2, lower1, lower2 };
+            }
+
+            const priceChart = LightweightCharts.createChart(elements.priceChart, {
+                width: elements.priceChart.offsetWidth,
+                height: elements.priceChart.offsetHeight,
+                layout: { background: { color: '#161b22' }, textColor: '#D3D3D3', fontSize: 10 },
+                grid: { vertLines: { visible: false }, horzLines: { visible: false } },
+                crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#2A2A2A', rightOffset: 5, fixLeftEdge: false },
+                rightPriceScale: { borderColor: '#2A2A2A', autoScale: true }
+            });
+            const priceSeries = priceChart.addCandlestickSeries({
+                upColor: '#AAAAAA',
+                downColor: '#AAAAAA',
+                borderColor: '#AAAAAA',
+                wickUpColor: '#AAAAAA',
+                wickDownColor: '#AAAAAA'
+            });
+
+            const vwapSeries = priceChart.addLineSeries({ color: VWAP_COLOR, lineWidth: 1 });
+            const upper1Series = priceChart.addLineSeries({ color: UPPER_COLOR, lineWidth: 1 });
+            const upper2Series = priceChart.addLineSeries({ color: UPPER_COLOR, lineWidth: 2 });
+            const lower1Series = priceChart.addLineSeries({ color: LOWER_COLOR, lineWidth: 1 });
+            const lower2Series = priceChart.addLineSeries({ color: LOWER_COLOR, lineWidth: 2 });
+
+            function updateChartSize() {
+                priceChart.applyOptions({
+                    width: elements.priceChart.offsetWidth,
+                    height: elements.priceChart.offsetHeight
+                });
+            }
+
+            function animateBar(ctx, currentWidth, targetWidth, value, min, max, width, height, label, dollarValue, callback) {
+                const startTime = performance.now();
+                const startWidth = currentWidth;
+                function step(timestamp) {
+                    const elapsed = timestamp - startTime;
+                    const progress = Math.min(elapsed / ANIMATION_DURATION, 1);
+                    const easedProgress = 1 - Math.pow(1 - progress, 2);
+                    const newWidth = startWidth + (targetWidth - startWidth) * easedProgress;
+                    drawMeter(ctx, newWidth, value, min, max, width, height, label, dollarValue);
+                    if (progress < 1) {
+                        requestAnimationFrame(step);
+                    } else {
+                        callback(newWidth);
+                    }
+                }
+                requestAnimationFrame(step);
+            }
+
+            function drawMeter(ctx, barWidth, value, min, max, width, height, label, dollarValue) {
+                ctx.clearRect(0, 0, width, height);
+                const barHeight = height * 0.28;
+                const y = height * 0.75 - barHeight / 2;
+                const meterWidth = width;
+                const centerX = width / 2;
+                ctx.fillStyle = '#1c2526';
+                ctx.fillRect(0, y, meterWidth, barHeight);
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+                ctx.lineWidth = 1;
+                const paddedMax = max * RANGE_PADDING;
+                const paddedMin = min * RANGE_PADDING;
+                if (max > 0) {
+                    const maxX = centerX + (meterWidth / 2) * (max / paddedMax);
+                    ctx.beginPath();
+                    ctx.moveTo(maxX, y);
+                    ctx.lineTo(maxX, y + barHeight);
+                    ctx.stroke();
+                }
+                if (min < 0) {
+                    const minX = centerX - (meterWidth / 2) * (-min / -paddedMin);
+                    ctx.beginPath();
+                    ctx.moveTo(minX, y);
+                    ctx.lineTo(minX, y + barHeight);
+                    ctx.stroke();
+                }
+                ctx.strokeStyle = '#555555';
+                ctx.beginPath();
+                ctx.moveTo(centerX, y);
+                ctx.lineTo(centerX, y + barHeight);
+                ctx.stroke();
+                const intensity = Math.min(Math.abs(normalizedValue(value, min, max, label)), 1);
+                ctx.fillStyle = value >= 0 ? `rgba(0, 255, 255, ${0.5 + intensity * 0.5})` : `rgba(255, 85, 85, ${0.5 + intensity * 0.5})`;
+                if (value >= 0) {
+                    ctx.fillRect(centerX, y, barWidth, barHeight);
+                } else {
+                    ctx.fillRect(centerX - barWidth, y, barWidth, barHeight);
+                }
+                ctx.strokeStyle = '#888888';
+                ctx.strokeRect(0, y, meterWidth, barHeight);
+                ctx.fillStyle = '#D3D3D3';
+                ctx.font = '10px Arial';
+                ctx.textAlign = 'center';
+                ctx.fillText(label, width / 2, y - 10);
+                ctx.fillText(dollarValue, width / 2, y - 1);
+            }
+
+            function normalizedValue(value, min, max, label) {
+                if (label === 'Open Interest') {
+                    return max > 0 ? value / (max * RANGE_PADDING) : 0;
+                }
+                if (value >= 0) {
+                    return max > 0 ? value / (max * RANGE_PADDING) : 0;
+                } else {
+                    return min < 0 ? value / (min * RANGE_PADDING) : 0;
+                }
+            }
+
+            function updateMeterSizes() {
+                elements.spotCvdCanvas.width = elements.spotCvdCanvas.offsetWidth;
+                elements.spotCvdCanvas.height = elements.spotCvdCanvas.offsetHeight;
+                elements.cvdCanvas.width = elements.cvdCanvas.offsetWidth;
+                elements.cvdCanvas.height = elements.cvdCanvas.offsetHeight;
+                elements.oiCanvas.width = elements.oiCanvas.offsetWidth;
+                elements.oiCanvas.height = elements.oiCanvas.offsetHeight;
+                elements.liqCanvas.width = elements.liqCanvas.offsetWidth;
+                elements.liqCanvas.height = elements.liqCanvas.offsetHeight;
+                updateChartSize();
+                updateMeters();
+            }
+
+            function updateMeters() {
+                const spotCvdValue = spotCvdCumulative;
+                const cvdValue = cvdCumulative;
+                const oiValue = oiCumulative;
+                const liqValue = longPressure - shortPressure;
+                const spotCvdTargetWidth = (elements.spotCvdCanvas.width / 2) * Math.min(Math.abs(normalizedValue(spotCvdValue, spotCvdMin, spotCvdMax, 'Spot CVD')), 1);
+                const cvdTargetWidth = (elements.cvdCanvas.width / 2) * Math.min(Math.abs(normalizedValue(cvdValue, cvdMin, cvdMax, 'Perp CVD')), 1);
+                const oiTargetWidth = (elements.oiCanvas.width / 2) * Math.min(Math.abs(normalizedValue(oiValue, oiMin, oiMax, 'Open Interest')), 1);
+                const liqTargetWidth = (elements.liqCanvas.width / 2) * Math.min(Math.abs(normalizedValue(liqValue, liqMin, liqMax, 'LIQ')), 1);
+                animateBar(spotCvdCtx, spotCvdBarWidth, spotCvdTargetWidth, spotCvdValue, spotCvdMin, spotCvdMax, elements.spotCvdCanvas.width, elements.spotCvdCanvas.height, 'Spot CVD', formatDollar(spotCvdCumulative), (newWidth) => spotCvdBarWidth = newWidth);
+                animateBar(cvdCtx, cvdBarWidth, cvdTargetWidth, cvdValue, cvdMin, cvdMax, elements.cvdCanvas.width, elements.cvdCanvas.height, 'Perp CVD', formatDollar(cvdCumulative), (newWidth) => cvdBarWidth = newWidth);
+                animateBar(oiCtx, oiBarWidth, oiTargetWidth, oiValue, oiMin, oiMax, elements.oiCanvas.width, elements.oiCanvas.height, 'Open Interest', formatDollar(oiCumulative), (newWidth) => oiBarWidth = newWidth);
+                animateBar(liqCtx, liqBarWidth, liqTargetWidth, liqValue, liqMin, liqMax, elements.liqCanvas.width, elements.liqCanvas.height, 'Short LIQ  /  Long LIQ', `${formatDollar(shortPressure)}  /  ${formatDollar(longPressure)}`, (newWidth) => liqBarWidth = newWidth);
+            }
+
+            function updateBands() {
+                const bands = calculateVWAPAndBands();
+                const bandData = historicalData.map((bar, i) => ({
+                    time: bar.time,
+                    vwap: bands.vwap[i],
+                    upper1: bands.upper1[i],
+                    upper2: bands.upper2[i],
+                    lower1: bands.lower1[i],
+                    lower2: bands.lower2[i]
+                }));
+                vwapSeries.setData(bandData.map(d => ({ time: d.time, value: d.vwap })));
+                upper1Series.setData(bandData.map(d => ({ time: d.time, value: d.upper1 })));
+                upper2Series.setData(bandData.map(d => ({ time: d.time, value: d.upper2 })));
+                lower1Series.setData(bandData.map(d => ({ time: d.time, value: d.lower1 })));
+                lower2Series.setData(bandData.map(d => ({ time: d.time, value: d.lower2 })));
+            }
+
+            function updateHistoricalExtremes(type, value) {
+                if (type === 'spotCvd') {
+                    spotCvdHistory.push(value);
+                    if (spotCvdHistory.length > MAX_BARS) spotCvdHistory.shift();
+                    spotCvdMin = Math.min(...spotCvdHistory);
+                    spotCvdMax = Math.max(...spotCvdHistory);
+                } else if (type === 'cvd') {
+                    cvdHistory.push(value);
+                    if (cvdHistory.length > MAX_BARS) cvdHistory.shift();
+                    cvdMin = Math.min(...cvdHistory);
+                    cvdMax = Math.max(...cvdHistory);
+                } else if (type === 'oi') {
+                    oiHistory.push(value);
+                    if (oiHistory.length > MAX_BARS) oiHistory.shift();
+                    oiMin = Math.min(...oiHistory, 0);
+                    oiMax = Math.max(...oiHistory);
+                } else if (type === 'liq') {
+                    liqHistory.push(value);
+                    if (liqHistory.length > MAX_BARS) liqHistory.shift();
+                    liqMin = Math.min(...liqHistory);
+                    liqMax = Math.max(...liqHistory);
+                }
+            }
+
+            async function fetchHistoricalPriceData() {
+                const startTime = Math.floor(Date.now() / 1000) - (HISTORY_DAYS * 24 * 60 * 60);
+                try {
+                    const response = await fetch(`${KRAKEN_OHLC_URL}?pair=XBTUSD&interval=5&since=${startTime}`);
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    const data = await response.json();
+                    if (data.error.length > 0) throw new Error(`Kraken error: ${data.error}`);
+                    const bars = data.result['XXBTZUSD'] || [];
+                    if (!bars.length) throw new Error('No bars returned');
+                    historicalData = bars.map(bar => ({
+                        time: parseInt(bar[0], 10),
+                        open: parseFloat(bar[1]),
+                        high: parseFloat(bar[2]),
+                        low: parseFloat(bar[3]),
+                        close: parseFloat(bar[4])
+                    })).filter(isValidBar);
+                    volumeData = bars.map(bar => ({
+                        time: parseInt(bar[0], 10),
+                        value: parseFloat(bar[5])
+                    }));
+                    spotCvdCumulative = 0;
+                    oiCumulative = 0;
+                    historicalData = [...new Map(historicalData.map(bar => [bar.time, bar])).values()].sort((a, b) => a.time - b.time);
+                    lastBtcPrice = historicalData[historicalData.length - 1].close;
+                    lastSpotPrice = lastBtcPrice;
+                    priceSeries.setData(historicalData);
+                    currentBar = { ...historicalData[historicalData.length - 1] };
+                    currentVolume = 0;
+                    updateMeterSizes();
+                    updateBands();
+                    debounceTitle(lastBtcPrice);
+                    return true;
+                } catch (error) {
+                    connectionStatus.kraken = false;
+                    updateConnectionStatus();
+                    return false;
+                }
+            }
+
+            function updateSpotCvdCandle(timestamp, price, volume) {
+                let delta;
+                if (lastSpotPrice !== null) {
+                    if (price > lastSpotPrice) {
+                        delta = volume;
+                        lastSpotDirection = 1;
+                    } else if (price < lastSpotPrice) {
+                        delta = -volume;
+                        lastSpotDirection = -1;
+                    } else {
+                        delta = volume * lastSpotDirection;
+                    }
+                    spotCvdCumulative += delta;
+                    updateHistoricalExtremes('spotCvd', spotCvdCumulative);
+                }
+                lastSpotPrice = price;
+                updateMeters();
+            }
+
+            function updateCvdCandle(timestamp, value) {
+                cvdCumulative += value;
+                updateHistoricalExtremes('cvd', cvdCumulative);
+                updateMeters();
+                debounceTitle(lastBtcPrice);
+            }
+
+            function updateOiCandle(timestamp, value) {
+                if (lastOiValue !== null) {
+                    const delta = value - lastOiValue;
+                    oiCumulative += delta;
+                    updateHistoricalExtremes('oi', oiCumulative);
+                }
+                lastOiValue = value;
+                updateMeters();
+                debounceTitle(lastBtcPrice);
+            }
+
+            function updateLiqCandle(timestamp, value, side) {
+                const now = Date.now();
+                const timeElapsed = (now - lastPressureUpdate) / 60000;
+                lastPressureUpdate = now;
+                longPressure *= Math.pow(PRESSURE_DECAY, timeElapsed);
+                shortPressure *= Math.pow(PRESSURE_DECAY, timeElapsed);
+                const adjustedValue = value * LIQ_SENSITIVITY;
+                if (side === 'Buy') {
+                    longPressure += adjustedValue;
+                } else if (side === 'Sell') {
+                    shortPressure += adjustedValue;
+                }
+                const netPressure = longPressure - shortPressure;
+                updateHistoricalExtremes('liq', netPressure);
+                updateMeters();
+                debounceTitle(lastBtcPrice);
+            }
+
+            async function fetchBinanceOpenInterestLive() {
+                try {
+                    const response = await fetch(`${BINANCE_OI_URL}?symbol=BTCUSDT`);
+                    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                    const data = await response.json();
+                    const now = Math.floor(Date.now() / 1000);
+                    const value = parseFloat(data.openInterest);
+                    if (Number.isFinite(value)) {
+                        connectionStatus.binance = true;
+                        updateConnectionStatus();
+                        updateOiCandle(now, value);
+                    }
+                } catch (error) {
+                    connectionStatus.binance = false;
+                    updateConnectionStatus();
+                }
+            }
+
+            const krakenWs = createWebSocket(
+                KRAKEN_WS_URL,
+                (ws) => ws.send(JSON.stringify({ event: 'subscribe', pair: ['XBT/USD'], subscription: { name: 'trade' } })),
+                (event) => {
+                    const data = JSON.parse(event.data);
+                    if (!Array.isArray(data) || data.length < 2 || data[2] !== 'trade') return;
+                    const trade = data[1][0];
+                    const price = parseFloat(trade[0]);
+                    const volume = parseFloat(trade[1]);
+                    const timestamp = Math.floor(parseFloat(trade[2]));
+                    const barTime = Math.floor(timestamp / BAR_INTERVAL) * BAR_INTERVAL;
+                    if (!currentBar || currentBar.time !== barTime) {
+                        if (currentBar && isValidBar(currentBar)) {
+                            historicalData.push(currentBar);
+                            volumeData.push({ time: currentBar.time, value: currentVolume });
+                            priceSeries.update(currentBar);
+                            updateBands();
+                            updateMeters();
+                        }
+                        currentBar = { time: barTime, open: price, high: price, low: price, close: price };
+                        currentVolume = volume;
+                    } else {
+                        currentBar.high = Math.max(currentBar.high, price);
+                        currentBar.low = Math.min(currentBar.low, price);
+                        currentBar.close = price;
+                        currentVolume += volume;
+                    }
+                    updateSpotCvdCandle(timestamp, price, volume);
+                    tradeCount++;
+                    if (isValidBar(currentBar)) {
+                        priceSeries.update(currentBar);
+                        updateBands();
+                        lastBtcPrice = currentBar.close;
+                        debounceTitle(lastBtcPrice);
+                    }
+                },
+                'Kraken'
+            );
+
+            const bybitWs = createWebSocket(
+                BYBIT_WS_URL,
+                (ws) => ws.send(JSON.stringify({ op: 'subscribe', args: ['publicTrade.BTCUSDT', 'liquidation.BTCUSDT'] })),
+                (event) => {
+                    const data = JSON.parse(event.data);
+                    if (data.topic === 'liquidation.BTCUSDT' && data.data) {
+                        const timestamp = Math.floor(parseInt(data.ts) / 1000);
+                        const liqValue = parseFloat(data.data.size || data.data.qty || 0);
+                        const side = data.data.side;
+                        if (Number.isFinite(timestamp) && Number.isFinite(liqValue) && side) {
+                            updateLiqCandle(timestamp, liqValue, side);
+                        }
+                    } else if (data.topic === 'publicTrade.BTCUSDT' && data.data) {
+                        const trade = data.data[0];
+                        const volume = parseFloat(trade.v);
+                        const side = trade.S === 'Buy' ? 1 : -1;
+                        const timestamp = Math.floor(parseInt(trade.T) / 1000);
+                        if (Number.isFinite(volume) && Number.isFinite(timestamp)) {
+                            updateCvdCandle(timestamp, volume * side);
+                        }
+                    }
+                },
+                'Bybit'
+            );
+
+            priceChart.timeScale().fitContent();
+            updateMeterSizes();
+
+            const historicalSuccess = await fetchHistoricalPriceData();
+            if (!historicalSuccess) {
+                const now = Math.floor(Date.now() / 1000);
+                const barTime = Math.floor(now / BAR_INTERVAL) * BAR_INTERVAL;
+                historicalData = [{ time: barTime, open: 0, high: 0, low: 0, close: 0 }];
+                volumeData = [{ time: barTime, value: 0 }];
+                priceSeries.setData(historicalData);
+                currentBar = { ...historicalData[0] };
+                currentVolume = 0;
+                updateMeterSizes();
+                updateBands();
+                debounceTitle(0);
+            }
+
+            setInterval(fetchBinanceOpenInterestLive, OI_POLL_INTERVAL);
+            elements.loadingOverlay.style.display = 'none';
+            setTimeout(updateConnectionStatus, 5000);
+
+            window.addEventListener('resize', updateMeterSizes);
+            window.addEventListener('beforeunload', () => {
+                krakenWs.close();
+                bybitWs.close();
+            });
+        })();
+    </script>
+</body>
+</html>
